@@ -1,2 +1,4 @@
 schneider.vip/retryspool/storage/meta v0.0.0-20250731120916-f3e7b143bdcd h1:X6QNoHVOBxBDaKHlJWgCNKjpebNsW/1dTYxDeSZ/yLI=
 schneider.vip/retryspool/storage/meta v0.0.0-20250731120916-f3e7b143bdcd/go.mod h1:SZ4F8XBG+XI+AXlBbWMTchl4WudA0T0H85BpteAEpEY=
+schneider.vip/retryspool/storage/meta v0.0.2 h1:dWev+erz1KB4Z+LgwctyrmLPfkaSPok21+lXVYHUo9w=
+schneider.vip/retryspool/storage/meta v0.0.2/go.mod h1:SZ4F8XBG+XI+AXlBbWMTchl4WudA0T0H85BpteAEpEY=
