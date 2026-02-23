@@ -12,21 +12,48 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	metastorage "schneider.vip/retryspool/storage/meta"
 )
 
+// messageLock manages per-message read/write locking
+type messageLock struct {
+	mu       sync.RWMutex
+	refCount int32 // atomic: wie viele Goroutinen halten/wollen diesen Lock
+}
+
 // Backend implements metastorage.Backend for filesystem storage
 type Backend struct {
 	basePath string
-	mu       sync.RWMutex
+
+	// Per-Message Locks für CAS-Atomizität
+	messageLocks sync.Map // map[string]*messageLock
+
+	// Nur für closed-Flag
+	closedMu sync.RWMutex
 	closed   bool
-	
+
 	// Performance optimizations
 	disableSync bool // Disable fsync for better performance
 	batchSync   bool // Batch sync operations
+}
+
+// getMessageLock gibt den Lock für eine Message zurück (erstellt ihn bei Bedarf)
+func (b *Backend) getMessageLock(messageID string) *messageLock {
+	val, _ := b.messageLocks.LoadOrStore(messageID, &messageLock{})
+	lock := val.(*messageLock)
+	atomic.AddInt32(&lock.refCount, 1)
+	return lock
+}
+
+// releaseMessageLock gibt den Lock frei und räumt auf wenn keiner ihn mehr braucht
+func (b *Backend) releaseMessageLock(messageID string, lock *messageLock) {
+	if atomic.AddInt32(&lock.refCount, -1) <= 0 {
+		b.messageLocks.CompareAndDelete(messageID, lock)
+	}
 }
 
 // NewBackend creates a new filesystem metadata storage backend
@@ -70,12 +97,19 @@ func NewBackendWithOptions(basePath string, disableSync bool, batchSync bool) (*
 
 // StoreMeta stores message metadata
 func (b *Backend) StoreMeta(ctx context.Context, messageID string, metadata metastorage.MessageMetadata) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
+	b.closedMu.RLock()
 	if b.closed {
+		b.closedMu.RUnlock()
 		return metastorage.ErrBackendClosed
 	}
+	b.closedMu.RUnlock()
+
+	lock := b.getMessageLock(messageID)
+	lock.mu.Lock()
+	defer func() {
+		lock.mu.Unlock()
+		b.releaseMessageLock(messageID, lock)
+	}()
 
 	// Update metadata timestamps
 	metadata.Updated = time.Now()
@@ -100,24 +134,38 @@ func (b *Backend) StoreMeta(ctx context.Context, messageID string, metadata meta
 
 // GetMeta retrieves message metadata
 func (b *Backend) GetMeta(ctx context.Context, messageID string) (metastorage.MessageMetadata, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
+	b.closedMu.RLock()
 	if b.closed {
+		b.closedMu.RUnlock()
 		return metastorage.MessageMetadata{}, metastorage.ErrBackendClosed
 	}
+	b.closedMu.RUnlock()
+
+	lock := b.getMessageLock(messageID)
+	lock.mu.RLock()
+	defer func() {
+		lock.mu.RUnlock()
+		b.releaseMessageLock(messageID, lock)
+	}()
 
 	return b.getMetadata(messageID)
 }
 
 // UpdateMeta updates message metadata
 func (b *Backend) UpdateMeta(ctx context.Context, messageID string, metadata metastorage.MessageMetadata) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
+	b.closedMu.RLock()
 	if b.closed {
+		b.closedMu.RUnlock()
 		return metastorage.ErrBackendClosed
 	}
+	b.closedMu.RUnlock()
+
+	lock := b.getMessageLock(messageID)
+	lock.mu.Lock()
+	defer func() {
+		lock.mu.Unlock()
+		b.releaseMessageLock(messageID, lock)
+	}()
 
 	// Get current metadata to preserve state location
 	currentMeta, err := b.getMetadata(messageID)
@@ -141,12 +189,19 @@ func (b *Backend) UpdateMeta(ctx context.Context, messageID string, metadata met
 
 // DeleteMeta removes message metadata
 func (b *Backend) DeleteMeta(ctx context.Context, messageID string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
+	b.closedMu.RLock()
 	if b.closed {
+		b.closedMu.RUnlock()
 		return metastorage.ErrBackendClosed
 	}
+	b.closedMu.RUnlock()
+
+	lock := b.getMessageLock(messageID)
+	lock.mu.Lock()
+	defer func() {
+		lock.mu.Unlock()
+		b.releaseMessageLock(messageID, lock)
+	}()
 
 	// Find and remove metadata file from any state
 	for _, state := range []metastorage.QueueState{
@@ -165,52 +220,59 @@ func (b *Backend) DeleteMeta(ctx context.Context, messageID string) error {
 	return metastorage.ErrMessageNotFound
 }
 
-// MoveToState moves a message to a different queue state atomically
+// MoveToState moves a message from one queue state to another atomically.
+// The storage layer guarantees CAS semantics — no read-check-write needed.
 func (b *Backend) MoveToState(ctx context.Context, messageID string, fromState, toState metastorage.QueueState) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
+	b.closedMu.RLock()
 	if b.closed {
+		b.closedMu.RUnlock()
 		return metastorage.ErrBackendClosed
 	}
+	b.closedMu.RUnlock()
 
-	// Atomic state verification: check file exists in expected state
-	oldPath := b.getMetaPath(messageID, fromState)
-	if _, err := os.Stat(oldPath); os.IsNotExist(err) {
-		return fmt.Errorf("message %s not found in state %s", messageID, fromState)
+	if fromState == toState {
+		return nil
 	}
 
-	// Load and verify state atomically
-	metadata, err := b.loadMetadataFileWithLock(oldPath)
+	// Per-Message EXCLUSIVE Lock → das ist die CAS-Garantie!
+	// Nur ein Caller pro Message kommt hier gleichzeitig rein.
+	lock := b.getMessageLock(messageID)
+	lock.mu.Lock()
+	defer func() {
+		lock.mu.Unlock()
+		b.releaseMessageLock(messageID, lock)
+	}()
+
+	// Unter dem Lock: Prüfe ob Datei im erwarteten State existiert
+	oldPath := b.getMetaPath(messageID, fromState)
+	if _, err := os.Stat(oldPath); os.IsNotExist(err) {
+		return metastorage.ErrStateConflict // ← Definierter Sentinel Error
+	}
+
+	// Lade und verifiziere (Belt & Suspenders)
+	metadata, err := b.loadMetadataFile(oldPath)
 	if err != nil {
 		return fmt.Errorf("failed to load metadata: %w", err)
 	}
-
-	// Double-check state consistency (could have changed during concurrent operation)
 	if metadata.State != fromState {
-		return fmt.Errorf("message %s is in state %s, expected %s", messageID, metadata.State, fromState)
+		return metastorage.ErrStateConflict
 	}
 
-	if metadata.State == toState {
-		return nil // Already in target state
-	}
-
-	// Update state and timestamp
-	oldState := metadata.State
+	// State-Transition
 	metadata.State = toState
 	metadata.Updated = time.Now()
 
-	return b.moveMetadataAtomic(messageID, oldState, toState, metadata)
+	return b.moveMetadataAtomic(messageID, fromState, toState, metadata)
 }
 
 // ListMessages lists messages with pagination and filtering
 func (b *Backend) ListMessages(ctx context.Context, state metastorage.QueueState, options metastorage.MessageListOptions) (metastorage.MessageListResult, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
+	b.closedMu.RLock()
 	if b.closed {
+		b.closedMu.RUnlock()
 		return metastorage.MessageListResult{}, metastorage.ErrBackendClosed
 	}
+	b.closedMu.RUnlock()
 
 	stateDir := filepath.Join(b.basePath, state.String())
 	entries, err := os.ReadDir(stateDir)
@@ -306,10 +368,10 @@ func (b *Backend) ListMessages(ctx context.Context, state metastorage.QueueState
 // NewMessageIterator creates an iterator for messages in a specific state
 func (b *Backend) NewMessageIterator(ctx context.Context, state metastorage.QueueState, batchSize int) (metastorage.MessageIterator, error) {
 	// Check if backend is closed with proper synchronization
-	b.mu.RLock()
+	b.closedMu.RLock()
 	closed := b.closed
-	b.mu.RUnlock()
-	
+	b.closedMu.RUnlock()
+
 	if closed {
 		return nil, metastorage.ErrBackendClosed
 	}
@@ -332,14 +394,14 @@ type filesystemIterator struct {
 	state     metastorage.QueueState
 	batchSize int
 	ctx       context.Context
-	
+
 	// Current state
-	entries   []os.DirEntry
-	current   int
-	offset    int
-	stateDir  string
-	closed    bool
-	mu        sync.RWMutex
+	entries  []os.DirEntry
+	current  int
+	offset   int
+	stateDir string
+	closed   bool
+	mu       sync.RWMutex
 }
 
 // Next returns the next message metadata
@@ -398,10 +460,13 @@ func (it *filesystemIterator) Next(ctx context.Context) (metastorage.MessageMeta
 		metaPath := filepath.Join(it.stateDir, entry.Name())
 
 		// CRITICAL FIX: Acquire backend lock during metadata loading to prevent race conditions
-		it.backend.mu.RLock()
+		// Note: Iterator uses per-message read lock for consistency during metadata load
+		lock := it.backend.getMessageLock(messageID)
+		lock.mu.RLock()
 		metadata, err := it.backend.loadMetadataFile(metaPath)
-		it.backend.mu.RUnlock()
-		
+		lock.mu.RUnlock()
+		it.backend.releaseMessageLock(messageID, lock)
+
 		if err != nil {
 			// Skip invalid metadata files and try next (continue loop)
 			continue
@@ -472,10 +537,15 @@ func (it *filesystemIterator) loadNextBatch(ctx context.Context) error {
 	default:
 	}
 
-	// Load batch with backend lock (but not iterator lock)
-	it.backend.mu.RLock()
+	// Load batch with backend closed check
+	it.backend.closedMu.RLock()
+	if it.backend.closed {
+		it.backend.closedMu.RUnlock()
+		return metastorage.ErrBackendClosed
+	}
+	it.backend.closedMu.RUnlock()
+
 	entries, err := it.loadBatchFromFilesystem()
-	it.backend.mu.RUnlock()
 
 	if err != nil {
 		return err
@@ -561,7 +631,7 @@ func (it *filesystemIterator) processEntry(ctx context.Context, entryInfo EntryI
 	}
 
 	messageID := strings.TrimSuffix(entryInfo.Entry.Name(), ".json")
-	
+
 	// Ensure we have a valid state directory
 	stateDir := entryInfo.StateDir
 	if stateDir == "" {
@@ -572,13 +642,15 @@ func (it *filesystemIterator) processEntry(ctx context.Context, entryInfo EntryI
 		stateDir = it.stateDir
 		it.mu.RUnlock()
 	}
-	
+
 	metaPath := filepath.Join(stateDir, entryInfo.Entry.Name())
 
-	// Load metadata with backend lock (no iterator lock needed)
-	it.backend.mu.RLock()
+	// Load metadata with backend per-message lock (no iterator lock needed)
+	lock := it.backend.getMessageLock(messageID)
+	lock.mu.RLock()
 	metadata, err := it.backend.loadMetadataFile(metaPath)
-	it.backend.mu.RUnlock()
+	lock.mu.RUnlock()
+	it.backend.releaseMessageLock(messageID, lock)
 
 	if err != nil {
 		return metastorage.MessageMetadata{}, false, fmt.Errorf("failed to load metadata: %w", err)
@@ -595,16 +667,15 @@ func (it *filesystemIterator) processEntry(ctx context.Context, entryInfo EntryI
 	return metadata, hasMore, nil
 }
 
-
 // loadBatch loads the next batch of directory entries with proper streaming
 func (it *filesystemIterator) loadBatch() error {
 	if it.stateDir == "" {
 		it.stateDir = filepath.Join(it.backend.basePath, it.state.String())
 	}
 
-	// CRITICAL FIX: Acquire backend lock during directory reading to prevent race conditions
-	it.backend.mu.RLock()
-	defer it.backend.mu.RUnlock()
+	// CRITICAL FIX: Acquire backend closedMu during directory reading to prevent race conditions
+	it.backend.closedMu.RLock()
+	defer it.backend.closedMu.RUnlock()
 
 	// Open directory for streaming reads
 	dir, err := os.Open(it.stateDir)
@@ -654,12 +725,11 @@ func (it *filesystemIterator) loadBatch() error {
 	return nil
 }
 
-
 // Close closes the iterator
 func (it *filesystemIterator) Close() error {
 	it.mu.Lock()
 	defer it.mu.Unlock()
-	
+
 	it.closed = true
 	it.entries = nil
 	return nil
@@ -667,8 +737,8 @@ func (it *filesystemIterator) Close() error {
 
 // Close closes the metadata storage backend
 func (b *Backend) Close() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.closedMu.Lock()
+	defer b.closedMu.Unlock()
 
 	b.closed = true
 	return nil
@@ -844,28 +914,35 @@ func (b *Backend) loadMetadataFileWithLock(path string) (metastorage.MessageMeta
 
 // RecoverFromCrash performs crash recovery by cleaning up orphaned temp files
 func (b *Backend) RecoverFromCrash() error {
+	b.closedMu.RLock()
+	if b.closed {
+		b.closedMu.RUnlock()
+		return metastorage.ErrBackendClosed
+	}
+	b.closedMu.RUnlock()
+
 	log.Println("Starting filesystem crash recovery...")
-	
+
 	tempFileCount := 0
 	err := filepath.Walk(b.basePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // Continue walking
 		}
-		
+
 		// Clean up orphaned temp files
 		if strings.Contains(info.Name(), ".tmp.") || strings.HasSuffix(info.Name(), ".tmp") {
 			log.Printf("Removing orphaned temp file: %s", path)
 			os.Remove(path)
 			tempFileCount++
 		}
-		
+
 		return nil
 	})
-	
+
 	if tempFileCount > 0 {
 		log.Printf("Cleaned up %d orphaned temp files", tempFileCount)
 	}
-	
+
 	return err
 }
 
@@ -876,7 +953,7 @@ func (b *Backend) syncDirectory(dirPath string) error {
 		return err
 	}
 	defer dir.Close()
-	
+
 	return dir.Sync()
 }
 
@@ -893,7 +970,7 @@ func (b *Backend) lockFile(file *os.File, exclusive bool) error {
 	if exclusive {
 		lockType = syscall.LOCK_EX // Exclusive lock
 	}
-	
+
 	return syscall.Flock(int(file.Fd()), lockType|syscall.LOCK_NB)
 }
 
@@ -905,10 +982,10 @@ func (b *Backend) unlockFile(file *os.File) error {
 // asyncCleanupTempFiles performs background cleanup of orphaned temp files
 func (b *Backend) asyncCleanupTempFiles() {
 	log.Println("Background temp file cleanup started...")
-	
+
 	tempFileCount := 0
 	startTime := time.Now()
-	
+
 	err := filepath.Walk(b.basePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -926,7 +1003,7 @@ func (b *Backend) asyncCleanupTempFiles() {
 				log.Printf("Warning: failed to remove temp file %s: %v", path, removeErr)
 			} else {
 				tempFileCount++
-				
+
 				// Rate limiting: small delay every 100 files to avoid I/O overload
 				if tempFileCount%100 == 0 {
 					time.Sleep(10 * time.Millisecond)
@@ -939,7 +1016,7 @@ func (b *Backend) asyncCleanupTempFiles() {
 	})
 
 	duration := time.Since(startTime)
-	
+
 	if err != nil {
 		log.Printf("Background crash recovery failed: %v", err)
 		return
