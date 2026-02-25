@@ -213,6 +213,12 @@ func (b *Backend) DeleteMeta(ctx context.Context, messageID string) error {
 	} {
 		metaPath := b.getMetaPath(messageID, state)
 		if err := os.Remove(metaPath); err == nil {
+			// Sync directory to ensure deletion is persistent
+			if !b.disableSync {
+				if syncErr := b.syncDirectory(filepath.Dir(metaPath)); syncErr != nil {
+					log.Printf("Warning: failed to sync directory %s after metadata deletion: %v", filepath.Dir(metaPath), syncErr)
+				}
+			}
 			return nil // Successfully removed
 		}
 	}
