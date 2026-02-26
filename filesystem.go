@@ -74,6 +74,7 @@ func NewBackendWithOptions(basePath string, disableSync bool, batchSync bool) (*
 		metastorage.StateDeferred,
 		metastorage.StateHold,
 		metastorage.StateBounce,
+		metastorage.StateArchived,
 	} {
 		dir := filepath.Join(basePath, state.String())
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -210,6 +211,7 @@ func (b *Backend) DeleteMeta(ctx context.Context, messageID string) error {
 		metastorage.StateDeferred,
 		metastorage.StateHold,
 		metastorage.StateBounce,
+		metastorage.StateArchived,
 	} {
 		metaPath := b.getMetaPath(messageID, state)
 		if err := os.Remove(metaPath); err == nil {
@@ -764,6 +766,7 @@ func (b *Backend) getMetadata(messageID string) (metastorage.MessageMetadata, er
 		metastorage.StateDeferred,
 		metastorage.StateHold,
 		metastorage.StateBounce,
+		metastorage.StateArchived,
 	} {
 		metaPath := b.getMetaPath(messageID, state)
 		if _, err := os.Stat(metaPath); err == nil {
